@@ -28,7 +28,7 @@ import itertools
 import pandas as pd
 from pulp import *
 
-INPUT_FILE = 'Input.xlsx'
+INPUT_FILE = 'Optimization_Input.xlsx'
 OUTPUT_FILE = 'Optimization_Output.xlsx'
 
 parts_df = pd.read_excel(INPUT_FILE, sheet_name='Parts')
