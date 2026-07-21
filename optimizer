@@ -1,0 +1,156 @@
+"""
+Tube Cost Optimizer
+
+Requirements:
+    pip install pandas openpyxl pulp
+
+Input workbook sheets:
+    Parts
+        Cut Length | Quantity
+
+    Stock
+        Stock Length | Cost/Rod
+
+    Settings
+        Parameter | Value
+
+Settings rows expected:
+    Cut Cost
+    Scrap Cost
+    Max Waste %
+    Max Pieces/Pattern
+
+Output workbook:
+    Optimization_Output.xlsx
+"""
+
+import itertools
+import pandas as pd
+from pulp import *
+
+INPUT_FILE = 'Input.xlsx'
+OUTPUT_FILE = 'Optimization_Output.xlsx'
+
+parts_df = pd.read_excel(INPUT_FILE, sheet_name='Parts')
+stock_df = pd.read_excel(INPUT_FILE, sheet_name='Stock')
+settings_df = pd.read_excel(INPUT_FILE, sheet_name='Settings')
+
+settings = dict(zip(settings_df['Parameter'], settings_df['Value']))
+
+CUT_COST = float(settings.get('Cut Cost', 0.25))
+SCRAP_COST = float(settings.get('Scrap Cost', 0.01))
+MAX_WASTE_PERCENT = float(settings.get('Max Waste %', 0.10))
+MAX_PATTERN_PIECES = int(settings.get('Max Pieces/Pattern', 5))
+
+PARTS = dict(zip(parts_df['Cut Length'], parts_df['Quantity']))
+STOCK = dict(zip(stock_df['Stock Length'], stock_df['Cost/Rod']))
+
+
+def generate_patterns(parts, stock):
+    patterns = []
+    lengths = list(parts.keys())
+
+    for stock_length, stock_cost in stock.items():
+        for piece_count in range(1, MAX_PATTERN_PIECES + 1):
+            for combo in itertools.combinations_with_replacement(lengths, piece_count):
+
+                total_length = sum(combo)
+
+                if total_length > stock_length:
+                    continue
+
+                waste = stock_length - total_length
+                waste_pct = waste / stock_length
+
+                if waste_pct > MAX_WASTE_PERCENT:
+                    continue
+
+                pattern_cost = (
+                    stock_cost
+                    + piece_count * CUT_COST
+                    + waste * SCRAP_COST
+                )
+
+                patterns.append({
+                    'stock': stock_length,
+                    'cuts': combo,
+                    'waste': round(waste, 4),
+                    'utilization': round(total_length / stock_length, 4),
+                    'cost': round(pattern_cost, 4)
+                })
+
+    return patterns
+
+
+patterns = generate_patterns(PARTS, STOCK)
+
+model = LpProblem('TubeOptimization', LpMinimize)
+
+x = [LpVariable(f'P{i}', lowBound=0, cat='Integer') for i in range(len(patterns))]
+
+model += lpSum(x[i] * patterns[i]['cost'] for i in range(len(patterns)))
+
+for part_length, required_qty in PARTS.items():
+    model += (
+        lpSum(
+            x[i] * patterns[i]['cuts'].count(part_length)
+            for i in range(len(patterns))
+        ) >= required_qty
+    )
+
+model.solve(PULP_CBC_CMD(msg=True))
+
+pattern_rows = []
+stock_summary = {}
+
+total_cost = 0
+weighted_scrap = 0
+
+for i in range(len(patterns)):
+    qty = value(x[i])
+
+    if qty is None or qty < 1:
+        continue
+
+    qty = int(round(qty))
+
+    p = patterns[i]
+
+    stock_summary[p['stock']] = stock_summary.get(p['stock'], 0) + qty
+
+    total_cost += qty * p['cost']
+    weighted_scrap += qty * p['waste']
+
+    pattern_rows.append({
+        'Stock Length': p['stock'],
+        'Pattern': ' + '.join(map(str, p['cuts'])),
+        'Quantity': qty,
+        'Waste Per Rod': p['waste'],
+        'Utilization': p['utilization'],
+        'Pattern Cost': p['cost']
+    })
+
+patterns_out = pd.DataFrame(pattern_rows)
+
+stock_out = pd.DataFrame([
+    {
+        'Stock Length': k,
+        'Rod Quantity': v,
+        'Estimated Spend': v * STOCK[k]
+    }
+    for k, v in stock_summary.items()
+])
+
+summary_out = pd.DataFrame([
+    ['Solver Status', LpStatus[model.status]],
+    ['Total Cost', total_cost],
+    ['Total Scrap (in)', weighted_scrap],
+    ['Patterns Generated', len(patterns)]
+], columns=['Metric', 'Value'])
+
+with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+    summary_out.to_excel(writer, sheet_name='Summary', index=False)
+    stock_out.to_excel(writer, sheet_name='Rod Purchases', index=False)
+    patterns_out.to_excel(writer, sheet_name='Patterns', index=False)
+
+print(f'Output written to {OUTPUT_FILE}')
